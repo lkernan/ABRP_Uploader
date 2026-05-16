@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">ABRP Uploader</string>
+
+    <!-- Main screen -->
+    <string name="card_config">Configuration</string>
+    <string name="hint_token">ABRP User Token</string>
+    <string name="helper_token">Find your token in the ABRP app: Settings → Connections → Generic (Manual Entry)</string>
+    <string name="btn_save">Save</string>
+    <string name="token_required">Enter your ABRP token first</string>
+
+    <string name="card_service">Upload Service</string>
+    <string name="label_upload_enabled">Enable background uploading</string>
+
+    <string name="status_stopped">Service not running</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_running_no_upload">Running — waiting for first upload</string>
+    <string name="status_last_upload">Last upload: %1$s (%2$s)</string>
+    <string name="status_ok">OK</string>
+
+    <!-- Notification -->
+    <string name="notif_channel_name">ABRP Upload Service</string>
+    <string name="notif_channel_desc">Shows vehicle telemetry upload status</string>
+    <string name="notif_title">ABRP Uploader</string>
+    <string name="notif_action_stop">Stop</string>
+</resources>
