@@ -9,6 +9,15 @@
     <string name="hint_token">ABRP User Token</string>
     <string name="helper_token">Find your token in the ABRP app: Settings → Connections → Generic (Manual Entry)</string>
     <string name="btn_save">Save</string>
+    <string name="btn_test">Test Connection</string>
+
+    <!-- Connection test -->
+    <string name="conn_testing">Testing…</string>
+    <string name="conn_ok">Connected — API responding OK</string>
+    <string name="conn_err_auth">Auth failed — check your API key and token</string>
+    <string name="conn_err_no_internet">No internet connection</string>
+    <string name="conn_err_timeout">Connection timed out</string>
+    <string name="conn_err_http">Server error (HTTP %1$d)</string>
     <string name="token_required">Enter your ABRP token first</string>
 
     <string name="card_service">Upload Service</string>

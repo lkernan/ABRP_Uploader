@@ -4,7 +4,9 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.os.Bundle;
+import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
 
@@ -16,16 +18,31 @@ import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.android.material.textfield.TextInputEditText;
 import com.google.android.material.textfield.TextInputLayout;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final int LOCATION_PERMISSION_REQUEST = 100;
 
-    private TextInputLayout apiKeyLayout;
+    private static final int COLOR_OK      = 0xFF4CAF50; // green
+    private static final int COLOR_ERROR   = 0xFFF44336; // red
+    private static final int COLOR_PENDING = 0xFF9E9E9E; // grey
+
+    private TextInputLayout   apiKeyLayout;
     private TextInputEditText apiKeyInput;
-    private TextInputLayout tokenLayout;
+    private TextInputLayout   tokenLayout;
     private TextInputEditText tokenInput;
-    private SwitchMaterial serviceSwitch;
-    private TextView statusText;
+    private SwitchMaterial    serviceSwitch;
+    private TextView          statusText;
+    private Button            testButton;
+    private View              connectionStatusRow;
+    private View              connectionIndicator;
+    private TextView          connectionStatusText;
     private SharedPreferences prefs;
 
     @Override
@@ -35,24 +52,28 @@ public class MainActivity extends AppCompatActivity {
 
         prefs = getSharedPreferences("abrp_prefs", MODE_PRIVATE);
 
-        apiKeyLayout = findViewById(R.id.api_key_layout);
-        apiKeyInput  = findViewById(R.id.api_key_input);
-        tokenLayout  = findViewById(R.id.token_layout);
-        tokenInput   = findViewById(R.id.token_input);
-        serviceSwitch = findViewById(R.id.service_switch);
-        statusText = findViewById(R.id.status_text);
-        Button saveButton = findViewById(R.id.save_button);
+        apiKeyLayout        = findViewById(R.id.api_key_layout);
+        apiKeyInput         = findViewById(R.id.api_key_input);
+        tokenLayout         = findViewById(R.id.token_layout);
+        tokenInput          = findViewById(R.id.token_input);
+        serviceSwitch       = findViewById(R.id.service_switch);
+        statusText          = findViewById(R.id.status_text);
+        testButton          = findViewById(R.id.test_button);
+        connectionStatusRow = findViewById(R.id.connection_status_row);
+        connectionIndicator = findViewById(R.id.connection_indicator);
+        connectionStatusText = findViewById(R.id.connection_status_text);
 
         apiKeyInput.setText(prefs.getString("api_key", ""));
         tokenInput.setText(prefs.getString("token", ""));
         serviceSwitch.setChecked(prefs.getBoolean("service_enabled", false));
 
-        saveButton.setOnClickListener(v -> saveToken());
+        findViewById(R.id.save_button).setOnClickListener(v -> saveCredentials());
+        testButton.setOnClickListener(v -> testConnection());
 
         serviceSwitch.setOnCheckedChangeListener((btn, checked) -> {
             if (checked) {
                 String apiKey = textOf(apiKeyInput);
-                String token  = currentToken();
+                String token  = textOf(tokenInput);
                 if (apiKey.isEmpty() || token.isEmpty()) {
                     serviceSwitch.setChecked(false);
                     if (apiKey.isEmpty()) apiKeyLayout.setError(getString(R.string.api_key_required));
@@ -81,7 +102,9 @@ public class MainActivity extends AppCompatActivity {
         refreshStatus();
     }
 
-    private void saveToken() {
+    // ---------- Credentials ----------
+
+    private void saveCredentials() {
         String apiKey = textOf(apiKeyInput);
         String token  = textOf(tokenInput);
         boolean valid = true;
@@ -111,21 +134,93 @@ public class MainActivity extends AppCompatActivity {
         refreshStatus();
     }
 
-    private String textOf(TextInputEditText field) {
-        CharSequence text = field.getText();
-        return text != null ? text.toString().trim() : "";
+    // ---------- Connection test ----------
+
+    private void testConnection() {
+        String apiKey = textOf(apiKeyInput);
+        String token  = textOf(tokenInput);
+
+        if (apiKey.isEmpty() || token.isEmpty()) {
+            if (apiKey.isEmpty()) apiKeyLayout.setError(getString(R.string.api_key_required));
+            if (token.isEmpty())  tokenLayout.setError(getString(R.string.token_required));
+            return;
+        }
+
+        setConnectionStatus(COLOR_PENDING, getString(R.string.conn_testing));
+        testButton.setEnabled(false);
+
+        new Thread(() -> {
+            String result = pingAbrp(apiKey, token);
+            runOnUiThread(() -> {
+                testButton.setEnabled(true);
+                if (result == null) {
+                    setConnectionStatus(COLOR_OK, getString(R.string.conn_ok));
+                } else {
+                    setConnectionStatus(COLOR_ERROR, result);
+                }
+            });
+        }).start();
     }
 
-    private String currentToken() {
-        return textOf(tokenInput);
+    /**
+     * Sends a minimal test request to the ABRP API.
+     * Returns null on success, or a short error string on failure.
+     */
+    private String pingAbrp(String apiKey, String token) {
+        HttpURLConnection conn = null;
+        try {
+            // Minimal valid telemetry payload
+            String tlm = "{\"utc\":" + (System.currentTimeMillis() / 1000) + ",\"soc\":0}";
+            String urlStr = "https://api.iternio.com/1/tlm/send"
+                    + "?api_key=" + URLEncoder.encode(apiKey, StandardCharsets.UTF_8.name())
+                    + "&token="   + URLEncoder.encode(token,  StandardCharsets.UTF_8.name())
+                    + "&tlm="     + URLEncoder.encode(tlm,    StandardCharsets.UTF_8.name());
+
+            conn = (HttpURLConnection) new URL(urlStr).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(8_000);
+            conn.setReadTimeout(8_000);
+
+            int code = conn.getResponseCode();
+            if (code == 200) return null;
+
+            // Read error body for a more helpful message
+            BufferedReader br = new BufferedReader(
+                    new InputStreamReader(conn.getErrorStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+            br.close();
+
+            if (code == 401) return getString(R.string.conn_err_auth);
+            return getString(R.string.conn_err_http, code);
+
+        } catch (java.net.UnknownHostException e) {
+            return getString(R.string.conn_err_no_internet);
+        } catch (java.net.SocketTimeoutException e) {
+            return getString(R.string.conn_err_timeout);
+        } catch (Exception e) {
+            return e.getMessage();
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
+
+    private void setConnectionStatus(int color, String message) {
+        connectionStatusRow.setVisibility(View.VISIBLE);
+        connectionIndicator.getBackground().setTint(color);
+        connectionStatusText.setText(message);
+        connectionStatusText.setTextColor(color);
+    }
+
+    // ---------- Service status ----------
 
     private void refreshStatus() {
         boolean running = prefs.getBoolean("service_running", false);
         boolean enabled = prefs.getBoolean("service_enabled", false);
 
         if (enabled && running) {
-            String lastTime = prefs.getString("last_upload_time", null);
+            String lastTime   = prefs.getString("last_upload_time",   null);
             String lastStatus = prefs.getString("last_upload_status", null);
             if (lastTime != null) {
                 statusText.setText(getString(R.string.status_last_upload, lastTime,
@@ -138,6 +233,13 @@ public class MainActivity extends AppCompatActivity {
         } else {
             statusText.setText(R.string.status_stopped);
         }
+    }
+
+    // ---------- Helpers ----------
+
+    private String textOf(TextInputEditText field) {
+        CharSequence text = field.getText();
+        return text != null ? text.toString().trim() : "";
     }
 
     private void requestLocationPermissionIfNeeded() {
