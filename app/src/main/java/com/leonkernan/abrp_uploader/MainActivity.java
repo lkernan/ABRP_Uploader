@@ -20,6 +20,8 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int LOCATION_PERMISSION_REQUEST = 100;
 
+    private TextInputLayout apiKeyLayout;
+    private TextInputEditText apiKeyInput;
     private TextInputLayout tokenLayout;
     private TextInputEditText tokenInput;
     private SwitchMaterial serviceSwitch;
@@ -33,12 +35,15 @@ public class MainActivity extends AppCompatActivity {
 
         prefs = getSharedPreferences("abrp_prefs", MODE_PRIVATE);
 
-        tokenLayout = findViewById(R.id.token_layout);
-        tokenInput = findViewById(R.id.token_input);
+        apiKeyLayout = findViewById(R.id.api_key_layout);
+        apiKeyInput  = findViewById(R.id.api_key_input);
+        tokenLayout  = findViewById(R.id.token_layout);
+        tokenInput   = findViewById(R.id.token_input);
         serviceSwitch = findViewById(R.id.service_switch);
         statusText = findViewById(R.id.status_text);
         Button saveButton = findViewById(R.id.save_button);
 
+        apiKeyInput.setText(prefs.getString("api_key", ""));
         tokenInput.setText(prefs.getString("token", ""));
         serviceSwitch.setChecked(prefs.getBoolean("service_enabled", false));
 
@@ -46,12 +51,15 @@ public class MainActivity extends AppCompatActivity {
 
         serviceSwitch.setOnCheckedChangeListener((btn, checked) -> {
             if (checked) {
-                String token = currentToken();
-                if (token.isEmpty()) {
+                String apiKey = textOf(apiKeyInput);
+                String token  = currentToken();
+                if (apiKey.isEmpty() || token.isEmpty()) {
                     serviceSwitch.setChecked(false);
-                    tokenLayout.setError(getString(R.string.token_required));
+                    if (apiKey.isEmpty()) apiKeyLayout.setError(getString(R.string.api_key_required));
+                    if (token.isEmpty())  tokenLayout.setError(getString(R.string.token_required));
                     return;
                 }
+                apiKeyLayout.setError(null);
                 tokenLayout.setError(null);
                 prefs.edit().putBoolean("service_enabled", true).apply();
                 startForegroundService(new Intent(this, AbrpUploadService.class));
@@ -67,19 +75,35 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        apiKeyInput.setText(prefs.getString("api_key", ""));
         tokenInput.setText(prefs.getString("token", ""));
         serviceSwitch.setChecked(prefs.getBoolean("service_enabled", false));
         refreshStatus();
     }
 
     private void saveToken() {
-        String token = currentToken();
+        String apiKey = textOf(apiKeyInput);
+        String token  = textOf(tokenInput);
+        boolean valid = true;
+
+        if (apiKey.isEmpty()) {
+            apiKeyLayout.setError(getString(R.string.api_key_required));
+            valid = false;
+        } else {
+            apiKeyLayout.setError(null);
+        }
         if (token.isEmpty()) {
             tokenLayout.setError(getString(R.string.token_required));
-            return;
+            valid = false;
+        } else {
+            tokenLayout.setError(null);
         }
-        tokenLayout.setError(null);
-        prefs.edit().putString("token", token).apply();
+        if (!valid) return;
+
+        prefs.edit()
+                .putString("api_key", apiKey)
+                .putString("token",   token)
+                .apply();
 
         if (serviceSwitch.isChecked()) {
             startForegroundService(new Intent(this, AbrpUploadService.class));
@@ -87,9 +111,13 @@ public class MainActivity extends AppCompatActivity {
         refreshStatus();
     }
 
-    private String currentToken() {
-        CharSequence text = tokenInput.getText();
+    private String textOf(TextInputEditText field) {
+        CharSequence text = field.getText();
         return text != null ? text.toString().trim() : "";
+    }
+
+    private String currentToken() {
+        return textOf(tokenInput);
     }
 
     private void refreshStatus() {

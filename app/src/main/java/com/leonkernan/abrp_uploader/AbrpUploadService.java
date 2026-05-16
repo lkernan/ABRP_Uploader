@@ -144,9 +144,14 @@ public class AbrpUploadService extends Service {
     }
 
     private void doUpload() {
-        String token = prefs.getString("token", "").trim();
+        String token  = prefs.getString("token",   "").trim();
+        String apiKey = prefs.getString("api_key", "").trim();
         if (token.isEmpty()) {
             updateNotification("No ABRP token — open app to configure");
+            return;
+        }
+        if (apiKey.isEmpty()) {
+            updateNotification("No API key — open app to configure");
             return;
         }
         if (carAdapter == null || !carAdapter.isConnected()) return;
@@ -176,14 +181,19 @@ public class AbrpUploadService extends Service {
         }
         tlm.append("}");
 
-        String tlmJson = tlm.toString();
+        final String tlmJson  = tlm.toString();
+        final String fToken   = token;
+        final String fApiKey  = apiKey;
+        final int    fSoc     = soc;
+        final float  fSpeed   = speedKmh;
 
         executor.execute(() -> {
             HttpURLConnection conn = null;
             try {
                 String urlStr = API_URL
-                        + "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8.name())
-                        + "&tlm=" + URLEncoder.encode(tlmJson, StandardCharsets.UTF_8.name());
+                        + "?api_key=" + URLEncoder.encode(fApiKey, StandardCharsets.UTF_8.name())
+                        + "&token="   + URLEncoder.encode(fToken,  StandardCharsets.UTF_8.name())
+                        + "&tlm="     + URLEncoder.encode(tlmJson, StandardCharsets.UTF_8.name());
 
                 conn = (HttpURLConnection) new URL(urlStr).openConnection();
                 conn.setRequestMethod("GET");
@@ -207,7 +217,7 @@ public class AbrpUploadService extends Service {
                             .putString("last_upload_time", time)
                             .putString("last_upload_status", "OK")
                             .apply();
-                    updateNotification("SOC " + soc + "% · " + Math.round(speedKmh) + " km/h · " + time);
+                    updateNotification("SOC " + fSoc + "% · " + Math.round(fSpeed) + " km/h · " + time);
                 } else {
                     prefs.edit().putString("last_upload_status", "HTTP " + code).apply();
                     updateNotification("Upload error: HTTP " + code);

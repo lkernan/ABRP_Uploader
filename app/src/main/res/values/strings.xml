@@ -3,6 +3,9 @@
 
     <!-- Main screen -->
     <string name="card_config">Configuration</string>
+    <string name="hint_api_key">ABRP API Key</string>
+    <string name="helper_api_key">Developer key from api.iternio.com — register your app to get one</string>
+    <string name="api_key_required">Enter your ABRP API key first</string>
     <string name="hint_token">ABRP User Token</string>
     <string name="helper_token">Find your token in the ABRP app: Settings → Connections → Generic (Manual Entry)</string>
     <string name="btn_save">Save</string>
