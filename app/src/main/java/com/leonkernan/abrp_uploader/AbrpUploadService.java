@@ -24,42 +24,78 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
+/**
+ * Foreground service that polls vehicle telemetry every 5 s and pushes it to ABRP.
+ *
+ * Reliability design:
+ *  - Uses ScheduledExecutorService (not Handler chains) so exceptions inside one
+ *    upload cycle cannot break the schedule. Even on a thrown RuntimeException
+ *    the next tick still fires.
+ *  - Uploads unconditionally: if the car adapter never connects we still emit
+ *    GPS + timestamp so ABRP at least sees the vehicle online.
+ *  - Car adapter (re-)connection is retried every 30 s by the scheduler itself
+ *    if {@link CarPropertyAdapter#isConnected()} is false. This handles the
+ *    case where the underlying android.car.Car createCar() / connect() call
+ *    fails silently with no listener callback.
+ *  - All IPC + HTTP happens on the scheduler thread, never the main thread.
+ */
 public class AbrpUploadService extends Service {
 
     public static final String ACTION_STOP = "com.leonkernan.abrp_uploader.STOP";
 
-    private static final String TAG = "AbrpUploadService";
-    private static final String CHANNEL_ID = "abrp_uploader";
-    private static final int NOTIF_ID = 1;
-    private static final long UPLOAD_INTERVAL_MS = 5_000;
-    private static final String API_URL = "https://api.iternio.com/1/tlm/send";
+    private static final String TAG             = "AbrpUploadService";
+    private static final String CHANNEL_ID      = "abrp_uploader";
+    private static final int    NOTIF_ID        = 1;
+    private static final long   UPLOAD_INTERVAL_SEC = 5;
+    private static final long   CAR_RECONNECT_INTERVAL_SEC = 30;
+    private static final String API_URL         = "https://api.iternio.com/1/tlm/send";
 
-    private SaicCarAdapter carAdapter;
-    private LocationManager locationManager;
-    private Location lastLocation;
-    private Handler handler;
-    private ExecutorService executor;
-    private SharedPreferences prefs;
+    // Set from the main thread (LocationListener uses Main looper), read from
+    // the scheduler thread inside doUpload. volatile is sufficient since Location
+    // is effectively immutable for our purposes.
+    private volatile Location lastLocation;
+
+    private CarPropertyAdapter   carAdapter;
+    private LocationManager      locationManager;
+    private ScheduledExecutorService scheduler;
+    private SharedPreferences    prefs;
+    private Handler              mainHandler;
+
+    private volatile long lastSuccessfulUploadMs = 0L;
+    private volatile long lastCarConnectAttemptMs = 0L;
 
     // ---------- Lifecycle ----------
 
     @Override
     public void onCreate() {
         super.onCreate();
-        prefs = getSharedPreferences("abrp_prefs", MODE_PRIVATE);
-        handler = new Handler(Looper.getMainLooper());
-        executor = Executors.newSingleThreadExecutor();
+        prefs       = getSharedPreferences("abrp_prefs", MODE_PRIVATE);
+        mainHandler = new Handler(Looper.getMainLooper());
+        scheduler   = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "abrp-upload");
+            t.setDaemon(false);
+            return t;
+        });
 
         createNotificationChannel();
-        startForeground(NOTIF_ID, buildNotification("Connecting to car…"));
-
+        startForeground(NOTIF_ID, buildNotification("Starting…"));
         prefs.edit().putBoolean("service_running", true).apply();
 
         connectCarAdapter();
         requestLocationUpdates();
+
+        // Fire the first upload after a short warm-up, then every UPLOAD_INTERVAL_SEC.
+        // scheduleWithFixedDelay ensures we always get at least UPLOAD_INTERVAL_SEC
+        // between cycles even if a previous upload was slow.
+        scheduler.scheduleWithFixedDelay(
+                this::safeUploadCycle,
+                3, UPLOAD_INTERVAL_SEC, TimeUnit.SECONDS);
+
+        Log.i(TAG, "Service started, upload scheduler armed");
     }
 
     @Override
@@ -73,21 +109,17 @@ public class AbrpUploadService extends Service {
     }
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 
     @Override
     public void onDestroy() {
-        handler.removeCallbacksAndMessages(null);
-        executor.shutdown();
-        if (carAdapter != null) {
-            carAdapter.unregisterAllListeners();
-            carAdapter.disconnect();
-        }
+        Log.i(TAG, "Service stopping");
+        if (scheduler != null) scheduler.shutdownNow();
+        if (carAdapter != null) carAdapter.disconnect();
         if (locationManager != null) {
             try { locationManager.removeUpdates(locationListener); } catch (Exception ignored) {}
         }
+        if (mainHandler != null) mainHandler.removeCallbacksAndMessages(null);
         prefs.edit().putBoolean("service_running", false).apply();
         super.onDestroy();
     }
@@ -95,57 +127,56 @@ public class AbrpUploadService extends Service {
     // ---------- Car adapter ----------
 
     private void connectCarAdapter() {
-        if (carAdapter != null) {
-            carAdapter.disconnect();
-        }
-        carAdapter = new SaicCarAdapter(new SaicCarAdapter.Listener() {
-            @Override
-            public void onConnected(boolean success) {
-                if (success) {
-                    carAdapter.registerAllListeners();
-                    scheduleUploads();
-                    updateNotification("Running");
-                } else {
-                    updateNotification("Car service unavailable — retrying in 30s");
-                    handler.postDelayed(() -> connectCarAdapter(), 30_000);
+        lastCarConnectAttemptMs = System.currentTimeMillis();
+        // Must run on main thread because ServiceConnection callbacks need a Looper.
+        mainHandler.post(() -> {
+            if (carAdapter != null) {
+                try { carAdapter.disconnect(); } catch (Exception ignored) {}
+            }
+            carAdapter = new CarPropertyAdapter(new CarPropertyAdapter.Listener() {
+                @Override
+                public void onConnected() {
+                    Log.i(TAG, "CarPropertyAdapter connected");
                 }
+                @Override
+                public void onDisconnected() {
+                    Log.w(TAG, "CarPropertyAdapter disconnected — scheduler will retry");
+                    // Reconnect is handled by the scheduler watchdog.
+                }
+            });
+            try {
+                carAdapter.connect(AbrpUploadService.this);
+            } catch (Throwable t) {
+                Log.e(TAG, "carAdapter.connect threw", t);
             }
-
-            @Override
-            public void onDisconnected() {
-                handler.removeCallbacks(uploadRunnable);
-                updateNotification("Car disconnected — retrying in 15s");
-                handler.postDelayed(() -> connectCarAdapter(), 15_000);
-            }
-
-            @Override public void onHvac(String key, Object value) {}
-            @Override public void onEv(String key, Object value) {}
-            @Override public void onGeneral(String key, Object value) {}
-            @Override public void onState(String key, Object value) {}
-            @Override public void onAudio(String key, Object value) {}
-            @Override public void onVehicleSetting(String key, Object value) {}
         });
-        carAdapter.connect(this);
     }
 
-    // ---------- Upload loop ----------
+    // ---------- Upload cycle (runs on scheduler thread) ----------
 
-    private final Runnable uploadRunnable = new Runnable() {
-        @Override
-        public void run() {
+    private void safeUploadCycle() {
+        try {
+            // Self-watchdog: if the car adapter looks dead and we haven't tried
+            // reconnecting recently, kick a reconnect.
+            if ((carAdapter == null || !carAdapter.isConnected())
+                    && System.currentTimeMillis() - lastCarConnectAttemptMs
+                       > CAR_RECONNECT_INTERVAL_SEC * 1000) {
+                Log.w(TAG, "Car adapter not connected, attempting reconnect");
+                connectCarAdapter();
+            }
             doUpload();
-            handler.postDelayed(this, UPLOAD_INTERVAL_MS);
+        } catch (Throwable t) {
+            // Absolutely never let an exception escape — would not break the
+            // schedule with scheduleWithFixedDelay's executor, but we want a
+            // clean log line anyway.
+            Log.e(TAG, "upload cycle threw", t);
         }
-    };
-
-    private void scheduleUploads() {
-        handler.removeCallbacks(uploadRunnable);
-        handler.post(uploadRunnable);
     }
 
     private void doUpload() {
         String token  = prefs.getString("token",   "").trim();
         String apiKey = prefs.getString("api_key", "").trim();
+
         if (token.isEmpty()) {
             updateNotification("No ABRP token — open app to configure");
             return;
@@ -154,93 +185,111 @@ public class AbrpUploadService extends Service {
             updateNotification("No API key — open app to configure");
             return;
         }
-        if (carAdapter == null || !carAdapter.isConnected()) return;
 
-        int soc          = carAdapter.getBatteryPercentage();
-        float speedKmh   = carAdapter.getSpeed();
-        int rangeKm      = carAdapter.getCurrentRange();
-        int chargeStatus = carAdapter.getChargeStatus();
-        float extTemp    = carAdapter.getOutsideTemperature();
-        long utc         = System.currentTimeMillis() / 1000;
+        // Read whatever the car will give us. Each getter has internal try/catch
+        // and returns 0 if the call fails — we keep going regardless.
+        boolean carUp = carAdapter != null && carAdapter.isConnected();
 
-        StringBuilder tlm = new StringBuilder()
-                .append("{\"utc\":").append(utc)
-                .append(",\"soc\":").append(soc)
-                .append(",\"speed\":").append(Math.round(speedKmh))
-                .append(",\"is_charging\":").append(chargeStatus != 0 ? 1 : 0)
-                .append(",\"est_battery_range\":").append(rangeKm)
-                .append(",\"ext_temp\":").append(Math.round(extTemp));
+        float speedKmh = carUp ? carAdapter.getFloatProperty(
+                CarPropertyAdapter.PROP_VEHICLE_SPEED,
+                CarPropertyAdapter.PROP_AREA_GLOBAL) : 0f;
 
-        if (lastLocation != null) {
-            tlm.append(",\"lat\":").append(lastLocation.getLatitude());
-            tlm.append(",\"lon\":").append(lastLocation.getLongitude());
-            if (lastLocation.hasAltitude())
-                tlm.append(",\"elevation\":").append(Math.round(lastLocation.getAltitude()));
-            if (lastLocation.hasBearing())
-                tlm.append(",\"heading\":").append(Math.round(lastLocation.getBearing()));
+        int soc = carUp ? Math.round(carAdapter.getFloatProperty(
+                CarPropertyAdapter.PROP_EV_BATTERY_PCT,
+                CarPropertyAdapter.PROP_AREA_GLOBAL)) : 0;
+
+        int rangeKm = carUp ? carAdapter.getIntProperty(
+                CarPropertyAdapter.PROP_EV_RANGE_KM,
+                CarPropertyAdapter.PROP_AREA_GLOBAL) : 0;
+
+        float extTemp = carUp ? carAdapter.getFloatProperty(
+                CarPropertyAdapter.PROP_OUTSIDE_TEMP,
+                CarPropertyAdapter.PROP_AREA_HVAC) : 0f;
+
+        long utc = System.currentTimeMillis() / 1000;
+        Location loc = lastLocation;
+
+        // Build telemetry JSON. Always include utc; only include vehicle-derived
+        // fields if we actually have a live car link (avoid blasting zeros).
+        StringBuilder tlm = new StringBuilder("{\"utc\":").append(utc);
+        if (carUp) {
+            tlm.append(",\"soc\":").append(soc)
+               .append(",\"speed\":").append(Math.round(speedKmh))
+               .append(",\"est_battery_range\":").append(rangeKm)
+               .append(",\"ext_temp\":").append(Math.round(extTemp));
+        }
+        if (loc != null) {
+            tlm.append(",\"lat\":").append(loc.getLatitude());
+            tlm.append(",\"lon\":").append(loc.getLongitude());
+            if (loc.hasAltitude())
+                tlm.append(",\"elevation\":").append(Math.round(loc.getAltitude()));
+            if (loc.hasBearing())
+                tlm.append(",\"heading\":").append(Math.round(loc.getBearing()));
         }
         tlm.append("}");
 
-        final String tlmJson  = tlm.toString();
-        final String fToken   = token;
-        final String fApiKey  = apiKey;
-        final int    fSoc     = soc;
-        final float  fSpeed   = speedKmh;
+        sendToAbrp(apiKey, token, tlm.toString(), soc, speedKmh, carUp);
+    }
 
-        executor.execute(() -> {
-            HttpURLConnection conn = null;
-            try {
-                String urlStr = API_URL
-                        + "?api_key=" + URLEncoder.encode(fApiKey, StandardCharsets.UTF_8.name())
-                        + "&token="   + URLEncoder.encode(fToken,  StandardCharsets.UTF_8.name())
-                        + "&tlm="     + URLEncoder.encode(tlmJson, StandardCharsets.UTF_8.name());
+    private void sendToAbrp(String apiKey, String token, String tlmJson,
+                            int soc, float speedKmh, boolean carUp) {
+        HttpURLConnection conn = null;
+        try {
+            String urlStr = API_URL
+                    + "?api_key=" + URLEncoder.encode(apiKey, StandardCharsets.UTF_8.name())
+                    + "&token="   + URLEncoder.encode(token,  StandardCharsets.UTF_8.name())
+                    + "&tlm="     + URLEncoder.encode(tlmJson, StandardCharsets.UTF_8.name());
 
-                conn = (HttpURLConnection) new URL(urlStr).openConnection();
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(8_000);
-                conn.setReadTimeout(8_000);
+            conn = (HttpURLConnection) new URL(urlStr).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(8_000);
+            conn.setReadTimeout(8_000);
 
-                int code = conn.getResponseCode();
-                BufferedReader br = new BufferedReader(new InputStreamReader(
-                        code == 200 ? conn.getInputStream() : conn.getErrorStream()));
-                StringBuilder sb = new StringBuilder();
-                String line;
-                while ((line = br.readLine()) != null) sb.append(line);
-                br.close();
+            int code = conn.getResponseCode();
+            BufferedReader br = new BufferedReader(new InputStreamReader(
+                    code == 200 ? conn.getInputStream() : conn.getErrorStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+            br.close();
 
-                Log.d(TAG, "ABRP [" + code + "]: " + sb);
+            Log.d(TAG, "ABRP [" + code + "]: " + sb);
 
-                if (code == 200) {
-                    String time = android.text.format.DateFormat
-                            .format("HH:mm:ss", System.currentTimeMillis()).toString();
-                    prefs.edit()
-                            .putString("last_upload_time", time)
-                            .putString("last_upload_status", "OK")
-                            .apply();
-                    updateNotification("SOC " + fSoc + "% · " + Math.round(fSpeed) + " km/h · " + time);
-                } else {
-                    prefs.edit().putString("last_upload_status", "HTTP " + code).apply();
-                    updateNotification("Upload error: HTTP " + code);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Upload failed: " + e.getMessage());
-                prefs.edit().putString("last_upload_status", e.getMessage()).apply();
-            } finally {
-                if (conn != null) conn.disconnect();
+            if (code == 200) {
+                lastSuccessfulUploadMs = System.currentTimeMillis();
+                String time = android.text.format.DateFormat
+                        .format("HH:mm:ss", lastSuccessfulUploadMs).toString();
+                prefs.edit()
+                        .putString("last_upload_time",   time)
+                        .putString("last_upload_status", "OK")
+                        .apply();
+                String detail = carUp
+                        ? ("SOC " + soc + "% · " + Math.round(speedKmh) + " km/h · " + time)
+                        : ("GPS only · " + time);
+                updateNotification(detail);
+            } else {
+                prefs.edit().putString("last_upload_status", "HTTP " + code).apply();
+                updateNotification("Upload error: HTTP " + code);
             }
-        });
+        } catch (java.net.UnknownHostException e) {
+            prefs.edit().putString("last_upload_status", "No internet").apply();
+            updateNotification("Offline — will retry");
+        } catch (Exception e) {
+            Log.e(TAG, "Upload failed", e);
+            prefs.edit().putString("last_upload_status",
+                    e.getClass().getSimpleName() + ": " + e.getMessage()).apply();
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
 
     // ---------- Location ----------
 
     private final LocationListener locationListener = new LocationListener() {
-        @Override
-        public void onLocationChanged(Location location) {
-            lastLocation = location;
-        }
-        @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
-        @Override public void onProviderEnabled(String provider) {}
-        @Override public void onProviderDisabled(String provider) {}
+        @Override public void onLocationChanged(Location location) { lastLocation = location; }
+        @Override public void onStatusChanged(String p, int s, Bundle e) {}
+        @Override public void onProviderEnabled(String p) {}
+        @Override public void onProviderDisabled(String p) {}
     };
 
     private void requestLocationUpdates() {

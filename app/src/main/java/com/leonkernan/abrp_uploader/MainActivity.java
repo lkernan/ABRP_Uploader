@@ -67,6 +67,20 @@ public class MainActivity extends AppCompatActivity {
         tokenInput.setText(prefs.getString("token", ""));
         serviceSwitch.setChecked(prefs.getBoolean("service_enabled", false));
 
+        // If the user wants the service running, kick it on every activity launch.
+        // startForegroundService is idempotent — if the service is already up this
+        // is a no-op aside from delivering a new intent. We don't trust
+        // service_running as a sole indicator because it can be stale-true if a
+        // previous process was force-killed (e.g. by `adb install -r`) without
+        // onDestroy running.
+        boolean enabled = prefs.getBoolean("service_enabled", false);
+        boolean haveCreds = !prefs.getString("token",   "").trim().isEmpty()
+                         && !prefs.getString("api_key", "").trim().isEmpty();
+        if (enabled && haveCreds) {
+            startForegroundService(new Intent(this, AbrpUploadService.class));
+            requestLocationPermissionIfNeeded();
+        }
+
         findViewById(R.id.save_button).setOnClickListener(v -> saveCredentials());
         testButton.setOnClickListener(v -> testConnection());
 
@@ -242,11 +256,29 @@ public class MainActivity extends AppCompatActivity {
         return text != null ? text.toString().trim() : "";
     }
 
+    /**
+     * Permissions that need a runtime grant (vs being granted at install time
+     * via the platform signature). CAR_SPEED and CAR_ENERGY are dangerous-level
+     * AAOS permissions — without these, the corresponding property reads throw
+     * SecurityException and we have no SOC / speed data.
+     */
+    private static final String[] RUNTIME_PERMISSIONS = {
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            "android.car.permission.CAR_SPEED",
+            "android.car.permission.CAR_ENERGY",
+    };
+
     private void requestLocationPermissionIfNeeded() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED) {
+        java.util.List<String> missing = new java.util.ArrayList<>();
+        for (String p : RUNTIME_PERMISSIONS) {
+            if (ContextCompat.checkSelfPermission(this, p)
+                    != PackageManager.PERMISSION_GRANTED) {
+                missing.add(p);
+            }
+        }
+        if (!missing.isEmpty()) {
             ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    missing.toArray(new String[0]),
                     LOCATION_PERMISSION_REQUEST);
         }
     }

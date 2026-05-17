@@ -10,6 +10,15 @@ android {
         }
     }
 
+    signingConfigs {
+        platform {
+            storeFile     file("C:/Users/leon/b4a.keystore")
+            storePassword "android"
+            keyAlias      "platform"
+            keyPassword   "android"
+        }
+    }
+
     defaultConfig {
         applicationId "com.leonkernan.abrp_uploader"
         minSdk 27
@@ -21,14 +30,28 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig signingConfigs.platform
+        }
         release {
             minifyEnabled false
+            signingConfig signingConfigs.platform
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+tasks.register('listKeystoreAliases') {
+    doLast {
+        def ks = java.security.KeyStore.getInstance("JKS")
+        new File("C:/Users/leon/b4a.keystore").withInputStream { stream ->
+            ks.load(stream, "android".toCharArray())
+        }
+        ks.aliases().each { println "ALIAS: ${it}" }
     }
 }
 
