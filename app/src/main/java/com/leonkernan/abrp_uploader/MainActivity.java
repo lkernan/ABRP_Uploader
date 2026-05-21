@@ -266,6 +266,7 @@ public class MainActivity extends AppCompatActivity {
             Manifest.permission.ACCESS_FINE_LOCATION,
             "android.car.permission.CAR_SPEED",
             "android.car.permission.CAR_ENERGY",
+            "android.car.permission.CAR_ENERGY_PORTS",
     };
 
     private void requestLocationPermissionIfNeeded() {

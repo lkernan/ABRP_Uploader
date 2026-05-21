@@ -206,6 +206,28 @@ public class AbrpUploadService extends Service {
                 CarPropertyAdapter.PROP_OUTSIDE_TEMP,
                 CarPropertyAdapter.PROP_AREA_HVAC) : 0f;
 
+        // Charge rate comes in mW (signed: +ve charging, -ve driving). ABRP wants kW.
+        float powerKw = carUp ? (carAdapter.getFloatProperty(
+                CarPropertyAdapter.PROP_EV_INSTANTANEOUS_CHARGE_RATE,
+                CarPropertyAdapter.PROP_AREA_GLOBAL) / 1_000_000f) : 0f;
+        boolean charging = carUp && carAdapter.getBooleanProperty(
+                CarPropertyAdapter.PROP_EV_CHARGE_PORT_CONNECTED,
+                CarPropertyAdapter.PROP_AREA_GLOBAL);
+
+        // Free derived signals
+        int gear = carUp ? carAdapter.getIntProperty(
+                CarPropertyAdapter.PROP_GEAR_SELECTION,
+                CarPropertyAdapter.PROP_AREA_GLOBAL) : 0;
+        boolean parked = gear == CarPropertyAdapter.GEAR_PARK;
+        // DCFC heuristic: charging at AC speeds (3-22 kW) is type-2; above ~25 kW
+        // it can only be DC fast.
+        boolean dcfc = charging && powerKw > 25f;
+
+        // Cabin temperature — try the standard HVAC property, may fail on this VHAL.
+        float cabinTemp = carUp ? carAdapter.getFloatProperty(
+                CarPropertyAdapter.PROP_CABIN_TEMP,
+                CarPropertyAdapter.PROP_AREA_HVAC) : 0f;
+
         long utc = System.currentTimeMillis() / 1000;
         Location loc = lastLocation;
 
@@ -216,7 +238,16 @@ public class AbrpUploadService extends Service {
             tlm.append(",\"soc\":").append(soc)
                .append(",\"speed\":").append(Math.round(speedKmh))
                .append(",\"est_battery_range\":").append(rangeKm)
-               .append(",\"ext_temp\":").append(Math.round(extTemp));
+               .append(",\"ext_temp\":").append(Math.round(extTemp))
+               .append(",\"power\":").append(String.format(java.util.Locale.US, "%.2f", powerKw))
+               .append(",\"is_charging\":").append(charging ? 1 : 0)
+               .append(",\"is_dcfc\":").append(dcfc ? 1 : 0)
+               .append(",\"is_parked\":").append(parked ? 1 : 0);
+            // Only send cabin_temp if we got a plausible reading — 0.0 likely
+            // means the property isn't supported on this VHAL.
+            if (cabinTemp > -50f && cabinTemp < 80f && cabinTemp != 0f) {
+                tlm.append(",\"cabin_temp\":").append(Math.round(cabinTemp));
+            }
         }
         if (loc != null) {
             tlm.append(",\"lat\":").append(loc.getLatitude());

@@ -43,6 +43,14 @@ public class CarPropertyAdapter {
     // Vendor EV cluster — matched against the SAIC stack's BatteryPercent / CurrentRange:
     public static final int PROP_EV_BATTERY_PCT = 0x2160F404; // float % (e.g. 90.5)
     public static final int PROP_EV_RANGE_KM    = 0x2140F41C; // int km
+    // Standard AAOS EV properties (may or may not be implemented by this VHAL —
+    // if not, look for vendor equivalents via probeVendorFloatProperties()):
+    //  - charge rate is signed mW: positive while charging, negative while driving
+    //  - charge port connected is bool: true when cable plugged in
+    public static final int PROP_EV_INSTANTANEOUS_CHARGE_RATE = 0x1160030C; // float mW, area 0
+    public static final int PROP_EV_CHARGE_PORT_CONNECTED     = 0x1120030A; // bool,    area 0
+    // Standard AAOS HVAC: cabin temperature (measured). Zoned — read from HVAC area.
+    public static final int PROP_CABIN_TEMP     = 0x15600903; // float °C, area 117
     public static final int PROP_AREA_GLOBAL    = 0;
     public static final int PROP_AREA_HVAC      = 117;
 
